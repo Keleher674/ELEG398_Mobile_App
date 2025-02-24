@@ -1,4 +1,4 @@
-# color_toggle_app
+# ELEG398_Mobile_App
 
 A new Flutter project.
 
