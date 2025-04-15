@@ -1,7 +1,9 @@
 import 'dart:async';
-import 'dart:math';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
+import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 void main() {
   runApp(MyApp());
@@ -34,9 +36,7 @@ class _DeviceIdInputScreenState extends State<DeviceIdInputScreen> {
   }
 
   void _submit() {
-    // Retrieve the device ID from the text field.
     String deviceId = _controller.text;
-    // Navigate to the chart screen and pass along the device ID.
     Navigator.push(
       context,
       MaterialPageRoute(
@@ -61,7 +61,6 @@ class _DeviceIdInputScreenState extends State<DeviceIdInputScreen> {
               style: TextStyle(fontSize: 20),
             ),
             SizedBox(height: 20),
-            // TextField that brings up the keyboard when tapped.
             TextField(
               controller: _controller,
               decoration: InputDecoration(
@@ -81,7 +80,7 @@ class _DeviceIdInputScreenState extends State<DeviceIdInputScreen> {
   }
 }
 
-/// Screen 2: The chart screen with the chart and the device ID display.
+/// Screen 2: The chart screen that displays BLE data.
 class ChartScreen extends StatefulWidget {
   final String deviceId;
   ChartScreen({required this.deviceId});
@@ -93,48 +92,120 @@ class ChartScreen extends StatefulWidget {
 class _ChartScreenState extends State<ChartScreen> {
   List<double> _dataPoints = [];
   double _currentValue = 0;
-  Timer? _timer;
-  final Random _random = Random();
+
+  // BLE-related objects.
+  final FlutterReactiveBle _ble = FlutterReactiveBle();
+  StreamSubscription<DiscoveredDevice>? _scanSubscription;
+  StreamSubscription<ConnectionStateUpdate>? _connectionSubscription;
+  StreamSubscription<List<int>>? _notificationSubscription;
 
   @override
   void initState() {
     super.initState();
-    // Add the first data point immediately.
-    _addDataPoint();
-    // Then add a new data point every 5 seconds.
-    _timer = Timer.periodic(Duration(seconds: 5), (timer) {
-      _addDataPoint();
-    });
+    _startBleScan();
   }
 
   @override
   void dispose() {
-    _timer?.cancel();
+    _scanSubscription?.cancel();
+    _connectionSubscription?.cancel();
+    _notificationSubscription?.cancel();
     super.dispose();
   }
 
-  void _addDataPoint() {
-    // Generate a random value between 60 and 75.
-    double newValue = 60 + _random.nextDouble() * 15;
-    setState(() {
-      _currentValue = newValue;
-      _dataPoints.add(newValue);
-      // Keep only the last 5 minutes of data (max 60 points at 5-second intervals).
-      if (_dataPoints.length > 60) {
-        _dataPoints.removeAt(0);
-      }
-    });
+  /// Requests required Bluetooth and location permissions.
+  Future<bool> _requestPermissions() async {
+    Map<Permission, PermissionStatus> statuses = await [
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.bluetoothAdvertise,
+      Permission.location,
+    ].request();
+
+    return statuses.values.every((status) => status.isGranted);
+  }
+
+  /// Starts scanning for BLE devices and filters by device name.
+  void _startBleScan() async {
+    bool permissionsGranted = await _requestPermissions();
+    if (!permissionsGranted) {
+      print("Permissions not granted");
+      return;
+    }
+    
+    _scanSubscription = _ble.scanForDevices(withServices: []).listen(
+      (device) {
+        // Compare device.name with the user-provided SHI Device ID (ignoring case).
+        if (device.name.toLowerCase() == widget.deviceId.toLowerCase()) {
+          print("Found target device: ${device.name} (${device.id})");
+          _scanSubscription?.cancel();
+          _connectToDevice(device);
+        }
+      },
+      onError: (error) {
+        print("Scan error: $error");
+      },
+    );
+  }
+
+  /// Connects to the discovered BLE device.
+  void _connectToDevice(DiscoveredDevice device) {
+    _connectionSubscription = _ble.connectToDevice(id: device.id).listen(
+      (connectionState) {
+        print("Connection state: ${connectionState.connectionState}");
+        if (connectionState.connectionState == DeviceConnectionState.connected) {
+          _subscribeToCharacteristic(device);
+        }
+      },
+      onError: (error) {
+        print("Connection error: $error");
+      },
+    );
+  }
+
+  /// Subscribes to the BLE characteristic to receive data.
+  void _subscribeToCharacteristic(DiscoveredDevice device) {
+    final serviceUuid = Uuid.parse("YOUR-SERVICE-UUID"); // Replace with your service UUID.
+    final characteristicUuid = Uuid.parse("YOUR-CHARACTERISTIC-UUID"); // Replace with your characteristic UUID.
+
+    final characteristic = QualifiedCharacteristic(
+      serviceId: serviceUuid,
+      characteristicId: characteristicUuid,
+      deviceId: device.id,
+    );
+
+    _notificationSubscription = _ble.subscribeToCharacteristic(characteristic).listen(
+      (data) {
+        // Assume the device sends a 4-byte float in little-endian format.
+        if (data.length >= 4) {
+          final value = ByteData.sublistView(Uint8List.fromList(data))
+              .getFloat32(0, Endian.little);
+          print("Received BLE data: $value");
+          setState(() {
+            _currentValue = value;
+            _dataPoints.add(value);
+            // Keep only the last 60 data points.
+            if (_dataPoints.length > 60) {
+              _dataPoints.removeAt(0);
+            }
+          });
+        }
+      },
+      onError: (error) {
+        print("Notification error: $error");
+      },
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    // Convert the data points into chart spots.
+    // Convert data points into chart spots.
     List<FlSpot> spots = [];
     for (int i = 0; i < _dataPoints.length; i++) {
       spots.add(FlSpot(i * 5.0, _dataPoints[i]));
     }
 
-    // Determine x-axis range.
+    // Define x-axis range.
     double minX, maxX;
     if (spots.isEmpty) {
       minX = 0;
@@ -160,13 +231,13 @@ class _ChartScreenState extends State<ChartScreen> {
         padding: const EdgeInsets.all(16.0),
         child: Column(
           children: [
-            // Display the current random value.
+            // Display the current BLE value.
             Text(
               "Current Value: ${_currentValue.toStringAsFixed(2)}",
               style: TextStyle(fontSize: 24, color: Colors.white),
             ),
             SizedBox(height: 20),
-            // The chart takes up the remaining space.
+            // The chart occupies the remaining space.
             Expanded(
               child: LineChart(
                 LineChartData(
@@ -236,7 +307,7 @@ class _ChartScreenState extends State<ChartScreen> {
               ),
             ),
             SizedBox(height: 20),
-            // Display the SHI Device ID below the chart.
+            // Display the current device ID.
             Text(
               "Current SHI Device ID: ${widget.deviceId}",
               style: TextStyle(fontSize: 18, color: Colors.white),
